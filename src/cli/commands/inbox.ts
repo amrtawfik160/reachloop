@@ -79,10 +79,10 @@ export const inboxCommands: Command[] = [
       };
     },
   },
-  {
-    path: 'inbox reply',
-    usage: 'reachloop inbox reply <@lead> --text "<message>" --yes [--account @a] [--idempotency-key k] [--dry-run]',
-    summary: 'Send a DM reply to someone who already wrote to this account.',
+  ...['reply', 'send'].map((verb): Command => ({
+    path: `inbox ${verb}`,
+    usage: `reachloop inbox ${verb} <@lead> --text "<message>" --yes [--account @a] [--idempotency-key k] [--dry-run]`,
+    summary: 'Send a DM, subject to account limits and optional reply-only policy.',
     db: 'required',
     options: {
       text: { type: 'string' },
@@ -105,5 +105,5 @@ export const inboxCommands: Command[] = [
       });
       return { data: result, hints: [`reachloop inbox show ${result.lead} --json`] };
     },
-  },
+  })),
 ];

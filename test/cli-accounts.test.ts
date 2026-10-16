@@ -1,3 +1,4 @@
+import { Database } from 'bun:sqlite';
 import { describe, expect, it } from 'bun:test';
 import { readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -13,7 +14,7 @@ describe('setup', () => {
 
     const init = await h.run('init');
     expect(init.code).toBe(0);
-    expect(init.json.data.notice).toContain('reply-only');
+    expect(init.json.data.notice).toContain('50');
     expect((await h.run('account', 'list')).json).toMatchObject({ ok: true, data: [], meta: { total: 0 } });
   });
 
@@ -43,7 +44,7 @@ describe('accounts', () => {
     const cookies = h.x.signIn('101', 'acme');
     const added = await h.run('account', 'add', '--cookies-file', await h.cookieFile(cookies));
     expect(added.code).toBe(0);
-    expect(added.json.data).toMatchObject({ handle: '@acme', status: 'active', signIn: 'cookies', dmToday: '0/50', created: true });
+    expect(added.json.data).toMatchObject({ handle: '@acme', status: 'active', signIn: 'cookies', dmToday: '0/50', replyOnly: false, created: true });
     expect(added.out).not.toContain(cookies.authToken);
     const db = await readFile(path.join(h.home, 'reachloop.db'));
     expect(db.includes(Buffer.from(cookies.authToken))).toBe(false);
@@ -95,8 +96,10 @@ describe('accounts', () => {
     await h.run('init');
     const file = await h.cookieFile(h.x.signIn('101', 'acme'));
     await h.run('account', 'add', '--cookies-file', file);
+    await h.run('limits', 'set', '@acme', '--dm', '83', '--reply-only', 'on');
     const again = await h.run('account', 'add', '--cookies-file', file);
-    expect(again.json.data.created).toBe(false);
+    expect(again.json.data).toMatchObject({ created: false, dmToday: '0/83', replyOnly: true });
+    expect((await h.run('limits', 'show', '@acme')).json.data).toMatchObject({ capDm: 83, replyOnly: true });
     expect((await h.run('account', 'list')).json.meta?.total).toBe(1);
   });
 
@@ -111,14 +114,68 @@ describe('accounts', () => {
 });
 
 describe('limits', () => {
-  it('defaults to 50 DMs a day and refuses a cap above 200', async () => {
+  it('persists toggles separately or together, allows zero, exposes account settings and logs changes', async () => {
     const h = await harness();
     await h.run('init');
     await h.run('account', 'add', '--cookies-file', await h.cookieFile(h.x.signIn('101', 'acme')));
-    expect((await h.run('limits', 'show', '@acme')).json.data).toMatchObject({ capDm: 50, hardMax: 200, remaining: 50 });
-    const tooHigh = await h.run('limits', 'set', '@acme', '--dm', '201');
+    expect((await h.run('limits', 'set', '@acme', '--reply-only', 'on')).json.data).toMatchObject({ capDm: 50, replyOnly: true });
+    expect((await h.run('limits', 'show', '@acme')).json.data.replyOnly).toBe(true);
+    expect((await h.run('account', 'show', '@acme')).json.data.replyOnly).toBe(true);
+    expect((await h.run('account', 'list')).json.data[0].replyOnly).toBe(true);
+    expect((await h.run('limits', 'set', '@acme', '--dm', '0')).json.data).toMatchObject({ capDm: 0, replyOnly: true });
+    expect((await h.run('limits', 'set', '@acme', '--dm', '250', '--reply-only', 'off')).json.data).toMatchObject({ capDm: 250, replyOnly: false });
+    expect((await h.run('limits', 'show', '@acme')).json.data).toMatchObject({ capDm: 250, replyOnly: false });
+    const db = new Database(path.join(h.home, 'reachloop.db'), { readonly: true });
+    expect(db.query("SELECT kind, data_json FROM events WHERE kind = 'reply_only_changed' ORDER BY id").all()).toEqual([
+      { kind: 'reply_only_changed', data_json: '{"replyOnly":true}' },
+      { kind: 'reply_only_changed', data_json: '{"replyOnly":false}' },
+    ]);
+    db.close();
+  });
+
+  it('rejects absent or invalid settings without changing either setting or writing events', async () => {
+    const h = await harness();
+    await h.run('init');
+    await h.run('account', 'add', '--cookies-file', await h.cookieFile(h.x.signIn('101', 'acme')));
+    await h.run('limits', 'set', '@acme', '--dm', '75', '--reply-only', 'on');
+    const file = path.join(h.home, 'reachloop.db');
+    const before = new Database(file, { readonly: true });
+    const events = before.query('SELECT * FROM events ORDER BY id').all();
+    before.close();
+    for (const args of [[], ['--reply-only', 'maybe'], ['--dm', '100', '--reply-only', 'bad'], ['--dm', '251', '--reply-only', 'off'], ['--dm', '-1', '--reply-only', 'off'], ['--dm', '1.5'], ['--dm', 'NaN'], ['--dm', ''], ['--dm', '  ']]) {
+      const result = await h.run('limits', 'set', '@acme', ...args);
+      expect(result.code).not.toBe(0);
+      expect((await h.run('limits', 'show', '@acme')).json.data).toMatchObject({ capDm: 75, replyOnly: true });
+    }
+    const after = new Database(file, { readonly: true });
+    expect(after.query('SELECT * FROM events ORDER BY id').all()).toEqual(events);
+    after.close();
+  });
+
+  it('rolls back both settings and audit events if any write fails', async () => {
+    const h = await harness();
+    await h.run('init');
+    await h.run('account', 'add', '--cookies-file', await h.cookieFile(h.x.signIn('101', 'acme')));
+    const file = path.join(h.home, 'reachloop.db');
+    const db = new Database(file);
+    const events = db.query('SELECT * FROM events ORDER BY id').all();
+    db.exec("CREATE TRIGGER fail_reply_only_log BEFORE INSERT ON events WHEN NEW.kind = 'reply_only_changed' BEGIN SELECT RAISE(ABORT, 'test write failure'); END");
+    db.close();
+    expect((await h.run('limits', 'set', '@acme', '--dm', '123', '--reply-only', 'on')).code).not.toBe(0);
+    expect((await h.run('limits', 'show', '@acme')).json.data).toMatchObject({ capDm: 50, replyOnly: false });
+    const check = new Database(file, { readonly: true });
+    expect(check.query('SELECT * FROM events ORDER BY id').all()).toEqual(events);
+    check.close();
+  });
+
+  it('defaults to 50 DMs a day and outbound allowed, accepts 250 and refuses 251', async () => {
+    const h = await harness();
+    await h.run('init');
+    await h.run('account', 'add', '--cookies-file', await h.cookieFile(h.x.signIn('101', 'acme')));
+    expect((await h.run('limits', 'show', '@acme')).json.data).toMatchObject({ capDm: 50, hardMax: 250, remaining: 50, replyOnly: false });
+    const tooHigh = await h.run('limits', 'set', '@acme', '--dm', '251');
     expect(tooHigh.code).toBe(6);
     expect(tooHigh.json.error?.code).toBe('CAP_ABOVE_MAX');
-    expect((await h.run('limits', 'set', '@acme', '--dm', '200')).json.data.capDm).toBe(200);
+    expect((await h.run('limits', 'set', '@acme', '--dm', '250')).json.data.capDm).toBe(250);
   });
 });

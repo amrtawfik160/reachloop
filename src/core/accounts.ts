@@ -16,6 +16,7 @@ export type Account = {
   signIn: SignInMethod;
   secretRef: string;
   capDm: number;
+  replyOnly: boolean;
   lastInboxSyncAt: number | null;
   createdAt: number;
 };
@@ -28,6 +29,7 @@ type AccountRow = {
   sign_in: SignInMethod;
   secret_ref: string;
   cap_dm: number;
+  reply_only: number;
   last_inbox_sync_at: number | null;
   created_at: number;
 };
@@ -41,6 +43,7 @@ function toAccount(row: AccountRow): Account {
     signIn: row.sign_in,
     secretRef: row.secret_ref,
     capDm: row.cap_dm,
+    replyOnly: row.reply_only === 1,
     lastInboxSyncAt: row.last_inbox_sync_at,
     createdAt: row.created_at,
   };

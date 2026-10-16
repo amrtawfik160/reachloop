@@ -11,6 +11,7 @@ export function accountView(app: App, account: Account) {
   return {
     handle: `@${account.handle}`,
     status: account.status,
+    replyOnly: account.replyOnly,
     dmToday: `${usage.sentToday}/${usage.capDm}`,
     signIn: account.signIn,
     lastInboxSyncAt: account.lastInboxSyncAt ? new Date(account.lastInboxSyncAt).toISOString() : null,

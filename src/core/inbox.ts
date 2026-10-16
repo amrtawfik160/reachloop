@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
+import { buildDmConversationId } from '../x/client';
 import type { XConversation, XMessage } from '../x/session';
-import { type Account, findAccount, listAccounts, resolveAccount, withX } from './accounts';
+import { type Account, bareHandle, findAccount, listAccounts, resolveAccount, withX } from './accounts';
 import { type App, localDay, logEvent } from './app';
 import { ReachloopError } from './errors';
 import { findLead, type Lead, upsertLead } from './leads';
@@ -210,7 +211,7 @@ export async function showConversation(
     lead,
     account: `@${account.handle}`,
     messages: rows.map((row) => ({ from: row.direction === 'in' ? 'them' : 'you', text: row.body, at: row.at, state: row.send_state })),
-    canReply: hasInbound,
+    canReply: account.status === 'active' && (!account.replyOnly || hasInbound),
   };
 }
 
@@ -233,68 +234,103 @@ export async function reply(
   args: { handle: string; account?: string; text: string; confirmed: boolean; idempotencyKey?: string; dryRun: boolean },
 ): Promise<ReplyResult> {
   const text = args.text.trim();
-  if (!text) throw new ReachloopError('USAGE', 'A reply needs --text.');
-  const lead = findLead(app, args.handle);
-  const account = conversationAccount(app, lead, args.account, 'default_account');
-  const conversation = conversationFor(app, account.id, lead.id);
-  const day = localDay(app.now());
-  const key = args.idempotencyKey ?? autoKey(account, lead, text, day);
-  const base = { account: `@${account.handle}`, lead: `@${lead.handle}`, text, capDm: account.capDm };
-
-  const prior = app.db
+  if (!text) throw new ReachloopError('USAGE', 'A DM needs --text.');
+  const handle = bareHandle(args.handle);
+  if (!/^[A-Za-z0-9_]{1,15}$/.test(handle)) throw new ReachloopError('USAGE', 'Use a valid X handle.');
+  const maybeLead = (name: string): Lead | null => {
+    try { return findLead(app, name); } catch (err) {
+      if (err instanceof ReachloopError && err.code === 'NOT_FOUND') return null;
+      throw err;
+    }
+  };
+  let lead = maybeLead(handle);
+  let account = lead ? conversationAccount(app, lead, args.account, 'default_account') : resolveAccount(app, args.account);
+  let day = localDay(app.now());
+  const priorFor = (key: string) => app.db
     .query<{ id: number; send_state: string | null; x_message_id: string | null }, [string]>(
       'SELECT id, send_state, x_message_id FROM messages WHERE dedupe_key = ?',
-    )
-    .get(key);
-  if (prior?.send_state === 'sent') {
-    return { ...base, status: 'already_sent', messageId: prior.x_message_id, sentToday: sentToday(app, account.id) };
-  }
-  if (prior?.send_state === 'reserved') {
-    throw new ReachloopError('CONFLICT', 'An earlier send with this key has no confirmed result yet.', {
-      hint: `reachloop inbox show @${lead.handle} --json`,
+    ).get(key);
+  const result = (status: ReplyResult['status'], messageId: string | null): ReplyResult => ({
+    account: `@${account.handle}`, lead: `@${lead?.handle ?? handle}`, text,
+    capDm: account.capDm, status, messageId, sentToday: sentToday(app, account.id),
+  });
+  const priorResult = (key: string): ReplyResult | null => {
+    const prior = priorFor(key);
+    if (prior?.send_state === 'sent') return result('already_sent', prior.x_message_id);
+    if (prior?.send_state === 'reserved') throw new ReachloopError('CONFLICT', 'An earlier send with this key has no confirmed result yet.', {
+      hint: `reachloop inbox show @${lead?.handle ?? handle} --json`,
     });
-  }
-
-  const check = (confirmed: boolean) =>
-    checkReply({
-      confirmed,
-      accountStatus: findAccount(app, account.handle).status,
+    return null;
+  };
+  const check = () => {
+    account = findAccount(app, account.handle);
+    const conversation = lead ? conversationFor(app, account.id, lead.id) : null;
+    const gate = checkReply({
+      confirmed: args.dryRun || args.confirmed,
+      accountStatus: account.status,
+      replyOnly: account.replyOnly,
       hasInbound: conversation?.has_inbound === 1,
-      sentToday: sentToday(app, account.id),
-      capDm: account.capDm,
+      sentToday: sentToday(app, account.id), capDm: account.capDm,
     });
-
-  if (args.dryRun) {
-    const gate = check(true);
     if (!gate.ok) throw gate.error;
-    return { ...base, status: 'dry_run', messageId: null, sentToday: sentToday(app, account.id) };
+  };
+  // A known idempotent result needs no network or new reservation.
+  if (lead || args.idempotencyKey) {
+    const prior = priorResult(args.idempotencyKey ?? autoKey(account, lead as Lead, text, day));
+    if (prior) return prior;
+  }
+  // Refuse before lookup, including unknown handles and CSV leads without ids.
+  check();
+  const recipient = lead?.xUserId ? null : await withX(app, account, (x) => x.lookup(handle));
+  const recipientId = lead?.xUserId ?? recipient?.xUserId;
+  if (!recipientId) throw new ReachloopError('NOT_FOUND', 'X did not return a recipient id.');
+  if (args.dryRun) {
+    check();
+    return result('dry_run', null);
   }
 
-  const reserveId = app.db
-    .transaction(() => {
-      const gate = check(args.confirmed);
-      if (!gate.ok) throw gate.error;
-      if (!conversation || !lead.xUserId) throw new ReachloopError('INTERNAL', 'reply passed the gate without a conversation');
-      if (prior) app.db.query('DELETE FROM messages WHERE id = ?').run(prior.id);
-      const inserted = app.db
-        .query(
-          "INSERT INTO messages (conversation_id, direction, body, dedupe_key, send_state, origin, at) VALUES (?, 'out', ?, ?, 'reserved', 'reply', ?)",
-        )
-        .run(conversation.id, text, key, app.now());
-      addUsage(app, account.id, day, 1);
-      return Number(inserted.lastInsertRowid);
-    })
-    .immediate();
+  const reservation = app.db.transaction(() => {
+    day = localDay(app.now());
+    // Nothing from before the asynchronous lookup is trusted as fresh policy or
+    // inbound evidence. Refusals roll back all new-thread bookkeeping.
+    const existingHandle = app.db.query<{ handle: string }, [string]>('SELECT handle FROM leads WHERE x_user_id = ?').get(recipientId)?.handle;
+    lead = maybeLead(existingHandle ?? handle);
+    check();
+    if (recipient) {
+      upsertLead(app, recipient, lead?.source ?? 'inbox');
+      lead = findLead(app, recipient.handle);
+    }
+    if (!lead) throw new ReachloopError('INTERNAL', 'recipient row missing');
+    const key = args.idempotencyKey ?? autoKey(account, lead, text, day);
+    const prior = priorResult(key);
+    if (prior) return { prior };
+    app.db.query(
+      'INSERT INTO conversations (account_id, lead_id, x_conversation_id, has_inbound) VALUES (?, ?, ?, 0) ON CONFLICT (account_id, lead_id) DO NOTHING',
+    ).run(account.id, lead.id, buildDmConversationId(account.xUserId, recipientId));
+    const conversation = conversationFor(app, account.id, lead.id);
+    if (!conversation) throw new ReachloopError('INTERNAL', 'conversation row missing');
+    const failed = priorFor(key);
+    if (failed) app.db.query('DELETE FROM messages WHERE id = ?').run(failed.id);
+    const inserted = app.db.query(
+      "INSERT INTO messages (conversation_id, direction, body, dedupe_key, send_state, origin, at) VALUES (?, 'out', ?, ?, 'reserved', 'reply', ?)",
+    ).run(conversation.id, text, key, app.now());
+    addUsage(app, account.id, day, 1);
+    return { reserveId: Number(inserted.lastInsertRowid) };
+  }).immediate();
+  if (reservation.prior) return reservation.prior;
+  const reserveId = reservation.reserveId;
+  if (!lead) throw new ReachloopError('INTERNAL', 'recipient row missing after reservation');
 
+  const sentLead = lead;
   try {
-    const sent = await withX(app, account, (x) => x.sendDm({ recipientId: lead.xUserId ?? '', text }));
+    const sent = await withX(app, account, (x) => x.sendDm({ recipientId, text }));
     app.db.transaction(() => {
       app.db.query("UPDATE messages SET send_state = 'sent', x_message_id = ?, at = ? WHERE id = ?").run(sent.messageId || null, app.now(), reserveId);
-      app.db.query('UPDATE conversations SET unread = 0, last_message_at = ? WHERE account_id = ? AND lead_id = ?').run(app.now(), account.id, lead.id);
-      app.db.query("UPDATE leads SET status = 'contacted' WHERE id = ? AND status = 'new'").run(lead.id);
+      app.db.query("UPDATE conversations SET unread = 0, last_message_at = ?, x_conversation_id = COALESCE(NULLIF(?, ''), x_conversation_id) WHERE account_id = ? AND lead_id = ?").run(app.now(), sent.conversationId, account.id, sentLead.id);
+      app.db.query("UPDATE leads SET status = 'contacted' WHERE id = ? AND status = 'new'").run(sentLead.id);
     })();
     logEvent(app, { kind: 'dm_sent', accountId: account.id, leadId: lead.id, data: { messageId: sent.messageId } });
-    return { ...base, status: 'sent', messageId: sent.messageId || null, sentToday: sentToday(app, account.id) };
+    return result('sent', sent.messageId || null);
   } catch (err) {
     const unknownOutcome = !(err instanceof ReachloopError) || err.code === 'NETWORK_ERROR';
     if (unknownOutcome) {

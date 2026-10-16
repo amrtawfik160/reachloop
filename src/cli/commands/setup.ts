@@ -14,7 +14,8 @@ import { accountView } from './account';
 
 export const X_RULES_NOTICE = [
   'Reachloop sends DMs from your own X account, from your own computer.',
-  'X allows automated DMs only to people who wrote to you first. Reachloop is reply-only by default and refuses any other DM.',
+  'You can initiate DMs by default, subject to X recipient permissions. The optional reply-only mode is disabled by default.',
+  'Each account defaults to 50 DMs per day, with a hard maximum of 250. These limits do not guarantee compliance with X rules.',
   'X may suspend accounts that it sees as automated. You are responsible for how you use your accounts.',
   'Reachloop has no built-in AI, no proxies and no telemetry. Your data stays in one file on this computer.',
 ].join('\n');

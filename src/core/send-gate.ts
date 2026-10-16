@@ -1,7 +1,7 @@
 import { ReachloopError } from './errors';
 
 export const DEFAULT_DAILY_DM_CAP = 50;
-export const MAX_DAILY_DM_CAP = 200;
+export const MAX_DAILY_DM_CAP = 250;
 
 export type AccountStatus = 'active' | 'paused' | 'session_expired' | 'suspended';
 
@@ -9,6 +9,7 @@ export type ReplyCheck = {
   confirmed: boolean;
   accountStatus: AccountStatus;
   hasInbound: boolean;
+  replyOnly: boolean;
   sentToday: number;
   capDm: number;
 };
@@ -17,8 +18,8 @@ export type GateResult = { ok: true } | { ok: false; error: ReachloopError };
 
 const refuse = (error: ReachloopError): GateResult => ({ ok: false, error });
 
-// Every DM goes through this check before it reaches X. Reply-only: a person
-// must have sent this account a DM (a message request counts) before we write.
+// Every DM goes through this check before it reaches X. Reply-only is optional;
+// when enabled, inbound evidence must belong to this sending account.
 export function checkReply(check: ReplyCheck): GateResult {
   if (!check.confirmed) {
     return refuse(
@@ -41,7 +42,7 @@ export function checkReply(check: ReplyCheck): GateResult {
       return refuse(new ReachloopError('INTERNAL', `unknown account status ${String(exhaustive)}`));
     }
   }
-  if (!check.hasInbound) {
+  if (check.replyOnly && !check.hasInbound) {
     return refuse(
       new ReachloopError('REPLY_ONLY', 'This person has not written to this account, so Reachloop will not DM them.', {
         hint: 'reachloop inbox sync',

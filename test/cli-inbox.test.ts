@@ -1,3 +1,4 @@
+import { Database } from 'bun:sqlite';
 import { describe, expect, it } from 'bun:test';
 import { XError } from '../src/x/session';
 import { harness } from './support/cli';
@@ -48,6 +49,7 @@ describe('send safety', () => {
     const h = await withConversation();
     h.x.search = [cold];
     await h.run('lead', 'search', '--keyword', 'x');
+    await h.run('limits', 'set', '@acme', '--reply-only', 'on');
     const result = await h.run('inbox', 'reply', '@stranger', '--text', 'Buy now', '--yes');
     expect(result.code).toBe(6);
     expect(result.json.error?.code).toBe('REPLY_ONLY');
@@ -146,5 +148,213 @@ describe('run once and status', () => {
     const status = await h.run();
     expect(status.json.data).toMatchObject({ unreadConversations: 1, leads: { replied: 1 } });
     expect(status.json.hints).toEqual(['reachloop inbox list --unread --json']);
+  });
+});
+
+function inspect(h: Awaited<ReturnType<typeof harness>>) {
+  const db = new Database(h.home + '/reachloop.db');
+  return { db, counts: () => ['leads', 'conversations', 'messages', 'daily_usage'].map(t => db.query('SELECT count(*) AS n FROM ' + t).get()) };
+}
+
+async function coldAccount() {
+  const h = await harness();
+  await h.run('init');
+  await h.run('account', 'add', '--cookies-file', await h.cookieFile(h.x.signIn('101', 'acme')));
+  h.x.search = [cold];
+  h.x.calls.length = 0;
+  return h;
+}
+
+describe('outbound defaults', () => {
+  it('starts a saved-lead thread by default and shares duplicate protection across aliases', async () => {
+    const h = await coldAccount();
+    await h.run('lead', 'search', '--keyword', 'x');
+    const sent = await h.run('inbox', 'send', '@stranger', '--text', 'hello', '--yes');
+    expect(sent.json.data).toMatchObject({ status: 'sent', sentToday: 1, capDm: 50 });
+    expect((await h.run('inbox', 'reply', '@stranger', '--text', 'hello', '--yes')).json.data.status).toBe('already_sent');
+    expect(h.x.sent).toHaveLength(1);
+    expect((await h.run('inbox', 'show', '@stranger')).json.data).toMatchObject({ canReply: true, messages: [{ from: 'you', text: 'hello', state: 'sent' }] });
+    const { db } = inspect(h);
+    expect(db.query('SELECT x_conversation_id, has_inbound FROM conversations').get()).toEqual({ x_conversation_id: '101:901', has_inbound: 0 });
+    db.close();
+  });
+
+  it('looks up a new handle only after confirmation and never persists dry runs', async () => {
+    const h = await coldAccount();
+    const { db, counts } = inspect(h);
+    const before = counts();
+    expect((await h.run('inbox', 'send', '@stranger', '--text', 'hello')).json.error?.code).toBe('CONFIRM_REQUIRED');
+    expect(h.x.calls).toEqual([]);
+    expect(counts()).toEqual(before);
+    expect((await h.run('inbox', 'send', '@stranger', '--text', 'hello', '--dry-run')).json.data.status).toBe('dry_run');
+    expect(h.x.calls).toEqual(['lookup:stranger']);
+    expect(counts()).toEqual(before);
+    expect(h.x.sent).toEqual([]);
+    expect((await h.run('inbox', 'reply', '@stranger', '--text', 'hello', '--yes')).json.data.status).toBe('sent');
+    expect((await h.run('inbox', 'send', '@stranger', '--text', 'hello', '--yes')).json.data.status).toBe('already_sent');
+    db.close();
+  });
+
+  it('resolves a CSV lead without an X id only on actual send, not dry-run', async () => {
+    const h = await coldAccount();
+    const csv = h.home + '/leads.csv';
+    await Bun.write(csv, 'handle,name\nstranger,Stranger\n');
+    expect((await h.run('lead', 'import', '--csv', csv)).code).toBe(0);
+    const { db, counts } = inspect(h);
+    const before = counts();
+    expect((await h.run('inbox', 'send', '@stranger', '--text', 'hello', '--dry-run')).code).toBe(0);
+    expect(counts()).toEqual(before);
+    expect(db.query('SELECT x_user_id FROM leads').get()).toEqual({ x_user_id: null });
+    expect((await h.run('inbox', 'send', '@stranger', '--text', 'hello', '--yes')).json.data.status).toBe('sent');
+    expect(db.query('SELECT x_user_id FROM leads').get()).toEqual({ x_user_id: '901' });
+    db.close();
+  });
+
+  it('blocks new handles before lookup for reply-only, paused and exhausted accounts', async () => {
+    const h = await coldAccount();
+    const { db, counts } = inspect(h);
+    const before = counts();
+    await h.run('limits', 'set', '@acme', '--reply-only', 'on');
+    expect((await h.run('inbox', 'send', '@stranger', '--text', 'hi', '--yes')).json.error?.code).toBe('REPLY_ONLY');
+    expect((await h.run('inbox', 'send', '@stranger', '--text', 'hi', '--dry-run')).json.error?.code).toBe('REPLY_ONLY');
+    await h.run('limits', 'set', '@acme', '--reply-only', 'off', '--dm', '0');
+    expect((await h.run('inbox', 'send', '@stranger', '--text', 'hi', '--yes')).json.error?.code).toBe('DAILY_CAP_REACHED');
+    await h.run('account', 'pause', '@acme');
+    expect((await h.run('inbox', 'send', '@stranger', '--account', '@acme', '--text', 'hi', '--yes')).json.error?.code).toBe('ACCOUNT_PAUSED');
+    expect(h.x.calls).toEqual([]);
+    expect(counts()).toEqual(before);
+    db.close();
+  });
+
+  it('requires inbound evidence for this account only, and switching policy off allows the same lead', async () => {
+    const h = await withConversation();
+    await h.run('inbox', 'sync');
+    await h.run('account', 'add', '--cookies-file', await h.cookieFile(h.x.signIn('102', 'other')));
+    await h.run('limits', 'set', '@other', '--reply-only', 'on');
+    const args = ['inbox', 'send', '@jane', '--account', '@other', '--text', 'hello', '--yes'];
+    h.x.calls.length = 0;
+    expect((await h.run(...args)).json.error?.code).toBe('REPLY_ONLY');
+    expect(h.x.calls).toEqual([]);
+    await h.run('limits', 'set', '@other', '--reply-only', 'off');
+    expect((await h.run(...args)).json.data.status).toBe('sent');
+    await h.run('limits', 'set', '@other', '--reply-only', 'on');
+    expect((await h.run('inbox', 'show', '@jane', '--account', '@other', '--cached')).json.data.canReply).toBe(false);
+    await h.run('limits', 'set', '@acme', '--reply-only', 'on');
+    expect((await h.run('inbox', 'reply', '@jane', '--account', '@acme', '--text', 'hi', '--yes')).code).toBe(0);
+  });
+
+  it('holds an uncertain first send and reconciles the canonical new thread through show', async () => {
+    const h = await coldAccount();
+    h.x.failNextSend = new XError('socket closed', 'NETWORK_ERROR');
+    const args = ['inbox', 'send', '@stranger', '--text', 'maybe', '--yes'];
+    expect((await h.run(...args)).json.error?.code).toBe('NETWORK_ERROR');
+    expect((await h.run(...args)).json.error?.code).toBe('CONFLICT');
+    expect((await h.run('inbox', 'show', '@stranger')).json.data.messages[0].state).toBe('sent');
+    expect((await h.run(...args)).json.data.status).toBe('already_sent');
+    expect(h.x.sent).toHaveLength(1);
+    expect((await h.run('limits', 'show', '@acme')).json.data.sentToday).toBe(1);
+  });
+
+  it('lets X enforce recipient privacy and releases rejected new-thread quota', async () => {
+    const h = await coldAccount();
+    h.x.search = [profile('901', 'stranger', { canDm: false })];
+    await h.run('limits', 'set', '@acme', '--dm', '250');
+    h.x.failNextSend = new XError('closed', 'DMS_CLOSED');
+    const args = ['inbox', 'send', '@stranger', '--text', 'hello', '--yes'];
+    expect((await h.run(...args)).json.error?.code).toBe('DMS_CLOSED');
+    expect((await h.run('limits', 'show', '@acme')).json.data.sentToday).toBe(0);
+    expect((await h.run(...args)).json.data).toMatchObject({ status: 'sent', capDm: 250, sentToday: 1 });
+  });
+});
+
+
+describe('fresh reservation checks', () => {
+  for (const change of [
+    { sql: "UPDATE accounts SET status = 'paused'", code: 'ACCOUNT_PAUSED' },
+    { sql: 'UPDATE accounts SET cap_dm = 0', code: 'DAILY_CAP_REACHED' },
+    { sql: 'UPDATE accounts SET reply_only = 1', code: 'REPLY_ONLY' },
+  ]) {
+    it('rechecks persisted policy after lookup: ' + change.code, async () => {
+      const h = await coldAccount();
+      const { db, counts } = inspect(h);
+      const before = counts();
+      h.x.onLookup = () => { db.exec(change.sql); };
+      expect((await h.run('inbox', 'send', '@stranger', '--text', 'hello', '--yes')).json.error?.code).toBe(change.code);
+      expect(h.x.calls).toEqual(['lookup:stranger']);
+      expect(h.x.sent).toEqual([]);
+      expect(counts()).toEqual(before);
+      db.close();
+    });
+  }
+
+  it('charges and deduplicates the actual reservation day after a lookup crosses midnight', async () => {
+    const h = await coldAccount();
+    h.x.onLookup = () => { h.advance(24 * 60 * 60 * 1000); };
+    const args = ['inbox', 'send', '@stranger', '--text', 'hello', '--yes'];
+    expect((await h.run(...args)).json.data.sentToday).toBe(1);
+    expect((await h.run(...args)).json.data.status).toBe('already_sent');
+    expect(h.x.sent).toHaveLength(1);
+    const { db } = inspect(h);
+    expect(db.query('SELECT day, count FROM daily_usage').all()).toEqual([{ day: '2026-10-17', count: 1 }]);
+    db.close();
+  });
+
+  it('accepts the 250th DM but refuses 251 before lookup and preserves quota on rejection', async () => {
+    const h = await coldAccount();
+    await h.run('limits', 'set', '@acme', '--dm', '250');
+    const { db } = inspect(h);
+    db.exec("INSERT INTO daily_usage (account_id, day, action, count) VALUES (1, '2026-10-16', 'dm', 249)");
+    expect((await h.run('inbox', 'send', '@stranger', '--text', 'last', '--yes')).json.data.sentToday).toBe(250);
+    h.x.calls.length = 0;
+    expect((await h.run('inbox', 'send', '@unknown', '--text', 'too many', '--yes')).json.error?.code).toBe('DAILY_CAP_REACHED');
+    expect(h.x.calls).toEqual([]);
+    db.close();
+  });
+
+  it('expires an undelivered unknown first-send reservation and releases its quota', async () => {
+    const h = await coldAccount();
+    h.x.failNextSend = new Error('no response');
+    const args = ['inbox', 'send', '@stranger', '--text', 'uncertain', '--yes'];
+    expect((await h.run(...args)).json.error?.code).toBe('NETWORK_ERROR');
+    expect((await h.run(...args)).json.error?.code).toBe('CONFLICT');
+    h.advance(61 * 60 * 1000);
+    // X confirms the canonical conversation exists but contains no sent message
+    h.x.inboxes.set('101', [{ conversationId: '101:901', peer: cold, unread: false, messages: [] }]);
+    expect((await h.run('inbox', 'show', '@stranger')).json.data.messages[0].state).toBe('failed');
+    expect((await h.run('limits', 'show', '@acme')).json.data.sentToday).toBe(0);
+    expect((await h.run(...args)).json.data.status).toBe('sent');
+  });
+});
+
+
+describe('conversation evidence', () => {
+  it('rechecks same-account inbound evidence inside the transaction', async () => {
+    const h = await withConversation();
+    await h.run('inbox', 'sync');
+    await h.run('limits', 'set', '@acme', '--reply-only', 'on');
+    const { db, counts } = inspect(h);
+    db.exec('UPDATE leads SET x_user_id = NULL');
+    h.x.search = [jane];
+    h.x.onLookup = () => { db.exec('UPDATE conversations SET has_inbound = 0'); };
+    const before = counts();
+    h.x.calls.length = 0;
+    expect((await h.run('inbox', 'send', '@jane', '--text', 'hello', '--yes')).json.error?.code).toBe('REPLY_ONLY');
+    expect(h.x.calls).toEqual(['lookup:jane']);
+    expect(counts()).toEqual(before);
+    expect(db.query('SELECT x_user_id FROM leads').get()).toEqual({ x_user_id: null });
+    db.close();
+  });
+
+  it('stores the real conversation id returned by X on success', async () => {
+    const h = await coldAccount();
+    const connect = h.x.connect;
+    h.x.connect = args => {
+      const session = connect(args);
+      return { ...session, sendDm: async args => ({ ...await session.sendDm(args), conversationId: 'x-returned-thread' }) };
+    };
+    expect((await h.run('inbox', 'send', '@stranger', '--text', 'hello', '--yes')).code).toBe(0);
+    const { db } = inspect(h);
+    expect(db.query('SELECT x_conversation_id FROM conversations').get()).toEqual({ x_conversation_id: 'x-returned-thread' });
+    db.close();
   });
 });
