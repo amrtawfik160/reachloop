@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 104 104" role="img" aria-labelledby="title">
+  <title id="title">Reachloop return loop</title>
+  <rect width="104" height="104" rx="16" fill="#FFFFFF"/>
+  <g transform="translate(0 4)"><g fill="none" stroke="#163F67" stroke-width="8" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M 79 31 A 34 34 0 1 0 19 65"/>
+    <path d="M 41 82 A 34 34 0 0 0 82 49 M 71 60 L 82 49 L 93 60"/>
+  </g>
+  <circle cx="27" cy="76" r="6" fill="#F6A873"/></g>
+</svg>

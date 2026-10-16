@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Typecheck, lint, test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: package.json
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun run lint
+      - run: bun test
+
+  compiled-binary:
+    name: Compiled binary TLS check (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: package.json
+      - run: bun install --frozen-lockfile
+      - run: bun scripts/build.ts scripts/phase0-probe.ts phase0-probe
+      - run: bun scripts/build.ts src/cli/main.ts reachloop
+      - name: Remove node_modules so the binary must use its embedded helper
+        run: rm -rf node_modules
+      - name: Run TLS check from the binary
+        run: |
+          set -euo pipefail
+          out="$(./dist/phase0-probe-* tls)"
+          echo "$out"
+          echo "$out" | grep -q '"ciphersMatchChrome120":true'
+      - name: Run the reachloop binary without node_modules
+        run: |
+          set -euo pipefail
+          export REACHLOOP_HOME="$RUNNER_TEMP/reachloop" REACHLOOP_SECRET_STORE=file
+          ./dist/reachloop-* init --json | grep -q '"ok":true'
+          ./dist/reachloop-* doctor --json | tee doctor.json
+          grep -q '"check":"x.com","ok":true' doctor.json
