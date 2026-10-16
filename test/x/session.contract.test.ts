@@ -120,3 +120,64 @@ describe('X adapter against recorded-shape responses', () => {
     expect(rotated).toEqual(['csrf-2']);
   });
 });
+
+const lookupProfileCases = [
+  { name: 'modern-only counts with unknown DM permission', fields: { relationship_counts: { followers: 5083, following: 3196 } }, followers: 5083, following: 3196, canDm: undefined },
+  { name: 'modern counts and false DM permission over conflicting legacy fields', fields: { relationship_counts: { followers: 5083, following: 3196 }, dm_permissions: { can_dm: false }, legacy: { followers_count: 9, friends_count: 8, can_dm: true } }, followers: 5083, following: 3196, canDm: false },
+  { name: 'modern zero counts over nonzero legacy fields', fields: { relationship_counts: { followers: 0, following: 0 }, legacy: { followers_count: 9, friends_count: 8 } }, followers: 0, following: 0, canDm: undefined },
+  { name: 'partial modern counts falling back to legacy including zero', fields: { relationship_counts: { followers: 5083 }, legacy: { followers_count: 9, friends_count: 0, can_dm: false } }, followers: 5083, following: 0, canDm: false },
+  { name: 'unknown counts and DM permission when omitted', fields: {}, followers: undefined, following: undefined, canDm: undefined },
+  { name: 'current true DM permission over legacy false', fields: { dm_permissions: { can_dm: true }, legacy: { can_dm: false } }, followers: undefined, following: undefined, canDm: true },
+];
+
+describe('profile lookup field compatibility', () => {
+  for (const operation of ['UserByRestId', 'UserByScreenName']) {
+    for (const fixture of lookupProfileCases) {
+      it(`${operation}: ${fixture.name}`, async () => {
+        route = (request) => {
+          expect(new URL(request.url).pathname).toEndWith(`/${operation}`);
+          return { status: 200, body: { data: { user: { result: {
+            __typename: 'User', rest_id: fx.SENDER_ID,
+            core: { screen_name: 'edgrows', name: 'Ed' },
+            profile_bio: { description: 'Founder' },
+            ...fixture.fields,
+          } } } } };
+        };
+        const session = connectX({ cookies: cookies(), onCookiesRotated: async () => {} });
+        const profile = await (operation === 'UserByRestId' ? session.me() : session.lookup('edgrows'));
+        expect(profile).toMatchObject({ handle: 'edgrows', bio: 'Founder', followers: fixture.followers, following: fixture.following, canDm: fixture.canDm });
+        expect(requests).toHaveLength(1);
+      });
+    }
+  }
+});
+
+describe('community count enrichment', () => {
+  it('enriches unknown counts without treating explicit zeros as missing', async () => {
+    const { TwitterGraphQLClient } = await import('../../src/x/client');
+    const user = (id: string, fields: Record<string, unknown>) => ({
+      __typename: 'User', rest_id: id, core: { screen_name: `user_${id}` }, ...fields,
+    });
+    route = (request) => {
+      const url = new URL(request.url);
+      if (url.pathname.endsWith('/membersSliceTimeline_Query')) {
+        return { status: 200, body: { data: { communityResults: { result: { members_slice: {
+          items_results: [
+            { result: user('1', { relationship_counts: { followers: 0, following: 0 } }) },
+            { result: user('2', {}) },
+            { result: user('3', { relationship_counts: { followers: 12 } }) },
+          ],
+        } } } } } };
+      }
+      expect(url.pathname).toEndWith('/UserByScreenName');
+      const handle = JSON.parse(url.searchParams.get('variables') ?? '{}').screen_name;
+      expect(['user_2', 'user_3']).toContain(handle);
+      return { status: 200, body: { data: { user: { result: user(handle.slice(-1), {}) } } } };
+    };
+    const page = await new TwitterGraphQLClient(cookies()).getCommunityMembers({ communityId: '77' });
+    expect(page.users.map((lead) => [lead.followerCount, lead.followingCount, lead.canDm])).toEqual([
+      [0, 0, undefined], [undefined, undefined, undefined], [12, undefined, undefined],
+    ]);
+    expect(requests).toHaveLength(3);
+  });
+});

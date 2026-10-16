@@ -131,7 +131,7 @@ export interface TwitterAuthCookies {
 export interface TwitterUserLookupResult {
   userId: string;
   screenName: string;
-  canDm: boolean;
+  canDm?: boolean;
   displayName?: string;
   profileImageUrl?: string;
   bio?: string;
@@ -275,6 +275,7 @@ interface TwitterUserResult {
   id_str?: string;
   /** Base64-encoded GraphQL global ID ("User:{numericId}") — fallback if rest_id absent. */
   id?: string;
+  relationship_counts?: { followers?: number; following?: number };
   legacy?: TwitterUserLegacy;
   /** Current location of the canDm flag in Twitter GraphQL responses. */
   dm_permissions?: { can_dm?: boolean };
@@ -729,7 +730,7 @@ async function lookupUserByRestIdWithQueryId(
   const dmPermsFlag = userResult.dm_permissions?.can_dm;
   const legacyFlag = userResult.legacy?.can_dm;
   const canDm =
-    (dmPermsFlag !== undefined ? dmPermsFlag : legacyFlag) !== false;
+    dmPermsFlag !== undefined ? dmPermsFlag : legacyFlag;
 
   return {
     userId: resolvedUserId,
@@ -739,8 +740,8 @@ async function lookupUserByRestIdWithQueryId(
     profileImageUrl: userResult.avatar?.image_url,
     bio: userResult.profile_bio?.description ?? userResult.legacy?.description,
     location: userResult.location?.location || undefined,
-    followerCount: userResult.legacy?.followers_count,
-    followingCount: userResult.legacy?.friends_count,
+    followerCount: userResult.relationship_counts?.followers ?? userResult.legacy?.followers_count,
+    followingCount: userResult.relationship_counts?.following ?? userResult.legacy?.friends_count,
     isVerified:
       userResult.is_blue_verified === true ||
       userResult.verification?.verified === true,
@@ -2258,7 +2259,7 @@ export class TwitterGraphQLClient {
     const dmPermsFlag = userResult.dm_permissions?.can_dm;
     const legacyFlag = userResult.legacy?.can_dm;
     const canDm =
-      (dmPermsFlag !== undefined ? dmPermsFlag : legacyFlag) !== false;
+      dmPermsFlag !== undefined ? dmPermsFlag : legacyFlag;
 
     return {
       userId,
@@ -2268,8 +2269,8 @@ export class TwitterGraphQLClient {
       profileImageUrl: userResult.avatar?.image_url,
       bio: userResult.profile_bio?.description ?? userResult.legacy?.description,
       location: userResult.location?.location || undefined,
-      followerCount: userResult.legacy?.followers_count,
-      followingCount: userResult.legacy?.friends_count,
+      followerCount: userResult.relationship_counts?.followers ?? userResult.legacy?.followers_count,
+      followingCount: userResult.relationship_counts?.following ?? userResult.legacy?.friends_count,
       isVerified:
         userResult.is_blue_verified === true ||
         userResult.verification?.verified === true,
@@ -2577,7 +2578,7 @@ export class TwitterGraphQLClient {
     const result = parseCommunityMembersTimelineResponse(parsed);
 
     // Community member slices ship lean user objects — most members come back
-    // with zero follower/following counts. We backfill counts via a per-member
+    // without follower/following counts. We backfill counts via a per-member
     // lookupUserByScreenName, but CAP how many we enrich per page. A single page
     // can now hold up to ~100 members, and enriching every one fired ~100 lookups
     // per page; across a multi-page scrape that drains the per-account lookup
@@ -2590,7 +2591,7 @@ export class TwitterGraphQLClient {
     // save still happens downstream via the bounded /api/twitter/users path.
     const MAX_ENRICH_PER_PAGE = 20;
     const usersNeedingEnrichment = result.users
-      .filter((user) => user.followerCount === 0 && user.followingCount === 0)
+      .filter((user) => user.followerCount === undefined || user.followingCount === undefined)
       .slice(0, MAX_ENRICH_PER_PAGE);
 
     if (usersNeedingEnrichment.length === 0) {

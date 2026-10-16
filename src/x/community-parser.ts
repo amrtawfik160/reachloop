@@ -14,11 +14,13 @@ interface CommunityUserResult {
   dm_permissions?: {
     can_dm?: boolean;
   };
+  relationship_counts?: { followers?: number; following?: number };
   legacy?: {
     created_at?: string;
     description?: string;
     followers_count?: number;
     friends_count?: number;
+    can_dm?: boolean;
   };
   location?: {
     location?: string;
@@ -76,12 +78,12 @@ function normalizeCommunityUser(result: CommunityUserResult): TwitterFollowerLea
     profileImageUrl: result.avatar?.image_url,
     bio: result.profile_bio?.description ?? result.legacy?.description,
     location: result.location?.location || undefined,
-    followerCount: Number(result.legacy?.followers_count ?? 0),
-    followingCount: Number(result.legacy?.friends_count ?? 0),
+    followerCount: result.relationship_counts?.followers ?? result.legacy?.followers_count,
+    followingCount: result.relationship_counts?.following ?? result.legacy?.friends_count,
     isVerified:
       result.is_blue_verified === true ||
       result.verification?.verified === true,
-    canDm: result.dm_permissions?.can_dm,
+    canDm: result.dm_permissions?.can_dm ?? result.legacy?.can_dm,
     createdAt: result.legacy?.created_at,
   };
 }

@@ -33,11 +33,13 @@ interface TimelineUserResult {
   dm_permissions?: {
     can_dm?: boolean;
   };
+  relationship_counts?: { followers?: number; following?: number };
   legacy?: {
     created_at?: string;
     description?: string;
     followers_count?: number;
     friends_count?: number;
+    can_dm?: boolean;
   };
   location?: {
     location?: string;
@@ -74,8 +76,8 @@ export interface TwitterFollowerLead {
   profileImageUrl?: string;
   bio?: string;
   location?: string;
-  followerCount: number;
-  followingCount: number;
+  followerCount?: number;
+  followingCount?: number;
   isVerified: boolean;
   canDm?: boolean;
   createdAt?: string;
@@ -118,13 +120,13 @@ function normalizeTimelineUser(
     profileImageUrl: result.avatar?.image_url,
     bio: result.profile_bio?.description ?? result.legacy?.description,
     location: result.location?.location || undefined,
-    followerCount: Number(result.legacy?.followers_count ?? 0),
-    followingCount: Number(result.legacy?.friends_count ?? 0),
+    followerCount: result.relationship_counts?.followers ?? result.legacy?.followers_count,
+    followingCount: result.relationship_counts?.following ?? result.legacy?.friends_count,
     isVerified:
       forceVerified ||
       result.is_blue_verified === true ||
       result.verification?.verified === true,
-    canDm: result.dm_permissions?.can_dm,
+    canDm: result.dm_permissions?.can_dm ?? result.legacy?.can_dm,
     createdAt: result.core?.created_at ?? result.legacy?.created_at,
   };
 }
