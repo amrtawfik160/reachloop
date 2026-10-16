@@ -12,13 +12,13 @@ export interface SecretStore {
 
 const SERVICE = 'reachloop';
 
-export function keychainStore(): SecretStore {
+export function keychainStore(secrets: typeof Bun.secrets = Bun.secrets): SecretStore {
   return {
     backend: 'keychain',
-    get: (name) => Bun.secrets.get({ service: SERVICE, name }),
-    set: (name, value) => Bun.secrets.set({ service: SERVICE, name, value }),
+    get: (name) => secrets.get({ service: SERVICE, name }),
+    set: (name, value) => secrets.set({ service: SERVICE, name, value }),
     delete: async (name) => {
-      await Bun.secrets.delete({ service: SERVICE, name });
+      await secrets.delete({ service: SERVICE, name });
     },
   };
 }

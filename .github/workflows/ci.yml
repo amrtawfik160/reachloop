@@ -25,6 +25,11 @@ jobs:
       - run: bun run typecheck
       - run: bun run lint
       - run: bun test
+      - name: Real Chrome sign-in integration (local test page only)
+        run: REACHLOOP_TEST_CHROME=1 bun test test/signin.test.ts
+      - name: Native macOS Keychain integration
+        if: runner.os == 'macOS'
+        run: REACHLOOP_TEST_KEYCHAIN=1 bun test test/secrets.test.ts
 
   compiled-binary:
     name: Compiled binary TLS check (${{ matrix.os }})

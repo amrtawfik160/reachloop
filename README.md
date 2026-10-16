@@ -30,12 +30,12 @@ X can still suspend accounts it sees as automated. Use an account you can afford
 
 ## Install
 
-Reachloop needs [Bun](https://bun.sh) 1.3 or later, on macOS or Linux.
+Reachloop needs [Bun](https://bun.sh) 1.4.3 or later, on macOS or Linux. Older Bun versions cannot read the checked-in lockfile. Run `bun upgrade` if needed.
 
 ```sh
 git clone https://github.com/amrtawfik160/reachloop.git
 cd reachloop
-bun install
+bun install --frozen-lockfile
 bun link
 reachloop init
 ```
@@ -114,7 +114,18 @@ bun run lint
 bun run build        # CI check only: one-file build in dist/, never shipped
 ```
 
-Tests never call x.com. See [AGENTS.md](AGENTS.md) for the rules agents follow when they change this repo.
+The default tests never call x.com, launch real Chrome, or access your OS keychain. Browser protocol and credential storage behavior are covered with local fakes.
+
+Run native integration checks explicitly on a machine with Chrome and an unlocked OS keychain:
+
+```sh
+REACHLOOP_TEST_CHROME=1 bun test test/signin.test.ts
+REACHLOOP_TEST_KEYCHAIN=1 bun test test/secrets.test.ts
+```
+
+These checks fail rather than silently skipping when explicitly enabled and their prerequisites are unavailable. The Chrome check uses only a local test page, never your X account.
+
+See [AGENTS.md](AGENTS.md) for the rules agents follow when they change this repo.
 
 ## License
 

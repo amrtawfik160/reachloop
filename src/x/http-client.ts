@@ -13,6 +13,7 @@
  * binary, communicates over an internal port). Call `disposeHttpClient()`
  * on shutdown.
  */
+import { createServer } from 'node:net';
 import zlib from 'node:zlib';
 import initCycleTLS, { type CycleTLSClient, type CycleTLSResponse } from 'cycletls';
 import { resolveTlsHelperPath } from './tls-helper';
@@ -70,30 +71,156 @@ const CHROME_120_HEADER_ORDER = [
 export const CHROME_120_USER_AGENT =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
-let clientPromise: Promise<CycleTLSClient> | null = null;
-let clientInstance: CycleTLSClient | null = null;
-
-async function getClient(): Promise<CycleTLSClient> {
-  if (clientInstance) return clientInstance;
-  if (!clientPromise) {
-    clientPromise = resolveTlsHelperPath().then((executablePath) => initCycleTLS({
-      executablePath,
-      // cycletls's `timeout` is the WebSocket-init deadline in milliseconds.
-      // The previous value (60) was a 60ms cap, which races the Go sidecar's
-      // own startup on slower hosts (notably macOS dev machines) and rejects
-      // with "Failed to initialize CycleTLS" before the binary is ready. 30s
-      // matches the per-request timeout default below and gives the sidecar
-      // ample room to bind its port and accept the WS handshake.
-      timeout: 30_000,
-      // autoExit cleans up the sidecar process if the parent exits without
-      // calling exit() — important so we never leak a Go process.
-      autoExit: true,
-    })).then((c) => {
-      clientInstance = c;
-      return c;
+/** Allocate a private sidecar port instead of attaching to another CLI's helper. */
+async function allocatePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const server = createServer();
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address();
+      server.close((error) => {
+        if (error) reject(error);
+        else if (address && typeof address !== 'string') resolve(address.port);
+        else reject(new Error('Could not allocate a TLS helper port'));
+      });
     });
+  });
+}
+
+function deadline<T>(work: Promise<T>, milliseconds: number, message: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), milliseconds);
+    work.then(resolve, reject).finally(() => clearTimeout(timer));
+  });
+}
+
+type InitOptions = NonNullable<Parameters<typeof initCycleTLS>[0]>;
+
+/** Dependency seam for offline lifecycle tests. No test needs to launch Go or contact X. */
+export interface HttpClientDependencies {
+  initialize?: typeof initCycleTLS;
+  resolveHelper?: typeof resolveTlsHelperPath;
+  allocatePort?: () => Promise<number>;
+  abandonInitialization?: (options: InitOptions) => Promise<void>;
+  initializationTimeoutMs?: number;
+  shutdownTimeoutMs?: number;
+}
+
+/** Creates an isolated lifecycle; the exported fetch functions use one shared instance. */
+export function createImpersonatedHttpClient(dependencies: HttpClientDependencies = {}) {
+  const initialize = dependencies.initialize ?? initCycleTLS;
+  const initTimeout = dependencies.initializationTimeoutMs ?? 30_000;
+  const shutdownTimeout = dependencies.shutdownTimeoutMs ?? 2_000;
+  const closed = new WeakSet<CycleTLSClient>();
+  const close = async (client: CycleTLSClient): Promise<void> => {
+    if (closed.has(client)) return;
+    closed.add(client);
+    try {
+      await deadline(Promise.resolve().then(() => client.exit()), shutdownTimeout,
+        'TLS helper shutdown timed out');
+    } catch {
+      // Shutdown is best effort, but must never keep the CLI waiting forever.
+    }
+  };
+  const abandon = dependencies.abandonInitialization ?? (dependencies.initialize
+    ? async () => {}
+    : async (options: InitOptions) => {
+      // CycleTLS 2.0.5 caches SharedInstance *before* awaiting initialization.
+      // Reacquiring our private port exposes exit() even after failed startup,
+      // allowing its own cleanup to kill the child and close internal sockets.
+      // Never do this on its shared default port: it may belong to another CLI.
+      const client = await initCycleTLS(options);
+      await close(client);
+    });
+  type Attempt = {
+    promise: Promise<CycleTLSClient>;
+    stopped: boolean;
+    client?: CycleTLSClient;
+    options?: InitOptions;
+    reject: (error: Error) => void;
+    cancelled: Promise<never>;
+    cleanup?: Promise<void>;
+  };
+  let current: Attempt | undefined;
+
+  function stop(attempt: Attempt, reason: Error): Promise<void> {
+    if (attempt.cleanup) return attempt.cleanup;
+    attempt.stopped = true;
+    if (current === attempt) current = undefined;
+    attempt.reject(reason);
+    attempt.cleanup = (async () => {
+      if (attempt.client) await close(attempt.client);
+      else if (attempt.options) {
+        try {
+          await deadline(Promise.resolve().then(() => abandon(attempt.options!)), shutdownTimeout,
+            'TLS helper startup cleanup timed out');
+        } catch {
+          // A late initialization result is also closed by the handler below.
+        }
+      }
+    })();
+    return attempt.cleanup;
   }
-  return clientPromise;
+
+  function getAttempt(): Attempt {
+    if (current) return current;
+    let reject!: (error: Error) => void;
+    const cancelled = new Promise<never>((_resolve, fail) => { reject = fail; });
+    // It can be cancelled after every request has finished.
+    void cancelled.catch(() => {});
+    const attempt: Attempt = {
+      promise: undefined as unknown as Promise<CycleTLSClient>, stopped: false, reject, cancelled,
+    };
+    current = attempt;
+    const startup = (async () => {
+      const [executablePath, port] = await Promise.all([
+        (dependencies.resolveHelper ?? resolveTlsHelperPath)(),
+        (dependencies.allocatePort ?? allocatePort)(),
+      ]);
+      if (attempt.stopped) throw new Error('TLS helper initialization cancelled');
+      attempt.options = { executablePath, port, timeout: initTimeout, autoExit: true };
+      const client = await initialize(attempt.options);
+      if (attempt.stopped) {
+        await close(client);
+        throw new Error('TLS helper initialization cancelled');
+      }
+      attempt.client = client;
+      return client;
+    })();
+    attempt.promise = deadline(Promise.race([startup, cancelled]), initTimeout, 'TLS helper initialization timed out')
+      .catch((error: unknown) => {
+        void stop(attempt, error instanceof Error ? error : new Error('TLS helper initialization failed'));
+        throw error;
+      });
+    return attempt;
+  }
+
+  return {
+    async fetchImpersonated(url: string, options: ImpersonatedFetchOptions = {}): Promise<ImpersonatedResponse> {
+      const timeout = options.timeoutMs ?? 30_000;
+      if (!Number.isFinite(timeout) || timeout <= 0) {
+        throw new Error('HTTP timeoutMs must be a positive finite number');
+      }
+      const attempt = getAttempt();
+      const work = (async () => {
+        const client = await attempt.promise;
+        if (attempt.stopped) throw new Error('TLS helper was disposed');
+        return performRequest(client, url, options);
+      })();
+      try {
+        // The Go timeout does not bound its WebSocket send/response promises.
+        // Include startup in the caller's total deadline, and do not retry a
+        // timed-out POST: X may already have accepted it.
+        return await deadline(Promise.race([work, attempt.cancelled]), timeout, 'HTTP request timed out');
+      } catch (error) {
+        void stop(attempt, new Error('TLS helper connection closed'));
+        throw error;
+      }
+    },
+    async disposeHttpClient(): Promise<void> {
+      if (current) await stop(current, new Error('TLS helper was disposed'));
+    },
+  };
 }
 
 export interface ImpersonatedFetchOptions {
@@ -245,11 +372,11 @@ function promoteSoftRateLimit(status: number, headers: Headers): number {
  * Errors thrown: `Error` for transport-level failures (DNS, connect refused,
  * timeout). Non-2xx responses do NOT throw — caller inspects `status`.
  */
-export async function fetchImpersonated(
+async function performRequest(
+  client: CycleTLSClient,
   url: string,
   options: ImpersonatedFetchOptions = {},
 ): Promise<ImpersonatedResponse> {
-  const client = await getClient();
   const method = (options.method ?? 'GET').toLowerCase() as
     | 'get'
     | 'post'
@@ -294,16 +421,6 @@ export async function fetchImpersonated(
   };
 }
 
-/**
- * Cleanly shuts down the cycletls sidecar. Call on process exit.
- */
-export async function disposeHttpClient(): Promise<void> {
-  if (!clientInstance) return;
-  try {
-    await clientInstance.exit();
-  } catch {
-    // ignore — sidecar may already be gone
-  }
-  clientInstance = null;
-  clientPromise = null;
-}
+const sharedHttpClient = createImpersonatedHttpClient();
+export const fetchImpersonated = sharedHttpClient.fetchImpersonated;
+export const disposeHttpClient = sharedHttpClient.disposeHttpClient;
