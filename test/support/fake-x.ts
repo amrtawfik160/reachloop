@@ -1,4 +1,4 @@
-import type { TwitterAuthCookies } from '../../src/x/client';
+import { buildDmConversationId, type TwitterAuthCookies } from '../../src/x/client';
 import { XError, type XConnect, type XConversation, type XMessage, type XProfile, type XSession } from '../../src/x/session';
 
 export type Sent = { from: string; recipientId: string; text: string };
@@ -16,6 +16,7 @@ export class FakeX {
   failNextSend: XError | Error | null = null;
   failInbox: XError | null = null;
   pageSize = 20;
+  onLookup: (() => void) | null = null;
   calls: string[] = [];
   now: () => number = Date.now;
 
@@ -27,7 +28,7 @@ export class FakeX {
 
   receive(accountXUserId: string, from: XProfile, text: string, at: number, kind: 'trusted' | 'untrusted' = 'trusted'): void {
     const inbox = this.inboxes.get(accountXUserId) ?? [];
-    const conversationId = `${from.xUserId}-${accountXUserId}`;
+    const conversationId = buildDmConversationId(from.xUserId, accountXUserId);
     let conversation = inbox.find((c) => c.conversationId === conversationId);
     if (!conversation) {
       conversation = { conversationId, peer: from, unread: true, messages: [] };
@@ -58,7 +59,10 @@ export class FakeX {
         return me();
       },
       lookup: async (handle) => {
-        const found = this.search.find((p) => p.handle === handle);
+        this.calls.push(`lookup:${handle}`);
+        this.onLookup?.();
+        me();
+        const found = this.search.find((p) => p.handle.toLowerCase() === handle.toLowerCase());
         if (!found) throw new XError('not found', 'USER_NOT_FOUND');
         return found;
       },
@@ -79,6 +83,7 @@ export class FakeX {
       },
       conversation: async (conversationId) => {
         const account = me();
+        this.calls.push(`conversation:${conversationId}`);
         return (this.inboxes.get(account.xUserId) ?? []).find((c) => c.conversationId === conversationId)?.messages ?? null;
       },
       sendDm: async ({ recipientId, text }) => {
@@ -98,9 +103,15 @@ export class FakeX {
 
   private deliver(account: XProfile, recipientId: string, text: string) {
     this.sent.push({ from: account.handle, recipientId, text });
-    const conversation = (this.inboxes.get(account.xUserId) ?? []).find((c) => c.peer.xUserId === recipientId);
+    const inbox = this.inboxes.get(account.xUserId) ?? [];
+    let conversation = inbox.find((c) => c.peer.xUserId === recipientId);
+    if (!conversation) {
+      conversation = { conversationId: buildDmConversationId(account.xUserId, recipientId), peer: this.search.find((p) => p.xUserId === recipientId) ?? profile(recipientId, recipientId), unread: false, messages: [] };
+      inbox.push(conversation);
+      this.inboxes.set(account.xUserId, inbox);
+    }
     const message: XMessage = { id: `sent-${this.sent.length}`, text, direction: 'out', at: this.now() };
     conversation?.messages.push(message);
-    return { messageId: message.id, conversationId: conversation?.conversationId ?? `${recipientId}-${account.xUserId}` };
+    return { messageId: message.id, conversationId: conversation?.conversationId ?? buildDmConversationId(recipientId, account.xUserId) };
   }
 }

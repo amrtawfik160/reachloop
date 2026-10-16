@@ -17,9 +17,16 @@ the user's own session cookies, from the user's own IP.
 ## Rules
 
 - Use Bun for everything: `bun install`, `bun test`, `bun run typecheck`, `bun run lint`.
-- Safety rules live in code, never only in the skill or docs: reply-only sending is the
-  default, the daily DM cap is 50 by default with a hard maximum of 200, and every send
-  passes the send gate first. A change that weakens one of these needs an owner decision.
+- Owner-approved sending defaults: outbound DMs are enabled, reply-only is optional
+  and off for existing and new accounts, and the daily DM cap is 50 per account with
+  a hard maximum of 250. Only an explicit user change raises an individual cap;
+  migrations must not raise saved caps automatically.
+- Safety rules live in code: every send passes the gate, including confirmation,
+  account/session state, daily cap and deduplication. When reply-only is on, require
+  a prior inbound DM to the same account (message requests count). Dry runs send
+  nothing and consume no quota; they do not need `--yes`, but retain the other
+  send checks.
+  Changes beyond these owner-approved settings need a new owner decision.
 - No proxies, no built-in AI, no telemetry. The calling agent writes every free-form
   message.
 - Never print, log, or commit session cookies (`auth_token`, `ct0`, `twid`). Tests use

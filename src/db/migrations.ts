@@ -100,4 +100,23 @@ export const MIGRATIONS: readonly string[] = [
 
   CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
   `,
+  `
+  CREATE TABLE accounts_new (
+    id INTEGER PRIMARY KEY,
+    x_user_id TEXT NOT NULL UNIQUE,
+    handle TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    status TEXT NOT NULL CHECK (status IN ('active','paused','session_expired','suspended')),
+    sign_in TEXT NOT NULL CHECK (sign_in IN ('cookies','browser')),
+    secret_ref TEXT NOT NULL,
+    cap_dm INTEGER NOT NULL DEFAULT 50 CHECK (cap_dm BETWEEN 0 AND 250),
+    last_inbox_sync_at INTEGER,
+    created_at INTEGER NOT NULL,
+    reply_only INTEGER NOT NULL DEFAULT 0 CHECK (reply_only IN (0, 1))
+  );
+  INSERT INTO accounts_new (
+    id, x_user_id, handle, status, sign_in, secret_ref, cap_dm, last_inbox_sync_at, created_at
+  ) SELECT id, x_user_id, handle, status, sign_in, secret_ref, cap_dm, last_inbox_sync_at, created_at FROM accounts;
+  DROP TABLE accounts;
+  ALTER TABLE accounts_new RENAME TO accounts;
+  `,
 ];

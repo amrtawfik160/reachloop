@@ -1,18 +1,32 @@
 # Sending rules
 
-## Reply-only
+## Outbound and optional reply-only
 
-X allows automated DMs only after the person has sent you a DM. Reachloop enforces this in code before every send. A person counts as having written first when any DM from them reached that same account, ever. A message request counts.
+Outbound DMs are enabled by default for existing and new accounts. `inbox send @handle` can initiate a conversation without a saved lead. `inbox reply` remains a backward-compatible alias and uses the same mode.
 
-`inbox sync` records who wrote first. Run it before `inbox reply` if a reply is refused with `REPLY_ONLY` and you believe the person did write.
+`reachloop limits set @a --reply-only on` restricts both commands to people who have sent a DM to that same sending account. Any prior inbound DM counts, including a message request. `--reply-only off` disables the restriction. `reachloop limits show @a` reports `replyOnly`, the cap, today's usage and `hardMax: 250`.
+
+`inbox sync @a` records inbound DMs and message requests. If `REPLY_ONLY` blocks a send to someone who already wrote, sync that account and retry. Do not change the mode without the user's request.
+
+## Platform restrictions
+
+The [X developer guidelines](https://docs.x.com/developer-guidelines) restrict automated DMs to people who sent you a DM first. Reachloop's outbound setting does not grant permission to send automated cold DMs. Recipient privacy settings and X permissions still apply, and X may restrict or suspend accounts for automation. Open DMs are not blanket permission for automated outreach.
 
 ## Daily cap
 
-Each account may send at most its cap per local calendar day. The default is 50. `reachloop limits set @a --dm N` changes it, up to a hard maximum of 200. No flag raises the maximum.
+Each account has a cap per local calendar day, defaulting to 50. `reachloop limits set @a --dm N` accepts a whole number from 0 to 250; 0 prevents sends. The hard maximum is 250. Change an individual cap only at the user's request; saved caps are never automatically raised. At the cap, sends fail with `DAILY_CAP_REACHED`.
+
+You can set either `--dm N` or `--reply-only on|off`, or both in one command.
+
+## Confirmation and account state
+
+Both send commands require `--yes` for a real send. Show the user the exact text and get their permission unless they already explicitly authorized sending without asking. Every send checks account/session state, caps and the optional reply-only restriction. Paused accounts cannot send; expired or suspended sessions remain blocked.
+
+`reachloop inbox send @jane --text "..." --dry-run` previews without sending or consuming quota. It does not require `--yes`, but account/session, cap and optional reply-only checks still apply. Get the user’s go-ahead before the real send.
 
 ## Duplicate protection
 
-Each send has an idempotency key. Without `--idempotency-key`, the key is the account, the person, the text and the day, so repeating the same command does not send twice (`status: already_sent`).
+Each send has an idempotency key. Without `--idempotency-key`, the key is the account, person, text and day, so repeating the same command does not send twice (`status: already_sent`). Send and reply share this protection.
 
 ## Accounts
 

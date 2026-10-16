@@ -7,26 +7,24 @@
 
 ![Your agents. Your computer. Local CLI for X leads and DM replies.](assets/hero.png)
 
-Reachloop is a command-line tool for X (Twitter) direct messages that AI coding agents can drive. You install it on your own computer, sign in to X, and let Claude Code or Codex find leads and answer the people who write to you.
+Reachloop is a command-line tool for X (Twitter) direct messages that AI coding agents can drive. You install it on your own computer, sign in to X, and let Claude Code or Codex find leads, start outbound conversations, and answer the people who write to you.
 
 - It runs on your computer and stores everything in one SQLite file.
 - It sends from your own X account and your own IP address. It has no proxies.
 - It has no built-in AI. Your agent writes every message.
 - It sends no telemetry.
 
-Status: early development. Expect breaking changes. The current CLI supports lead search and inbox replies. Campaigns and a background daemon are not implemented yet.
+Status: early development. Expect breaking changes. The current CLI supports lead search, outbound DMs and inbox replies. Campaigns and a background daemon are not implemented yet.
 
 ## How it works
-
-![Your agent calls the Reachloop CLI with commands and reads JSON. Reachloop keeps SQLite and session storage on your computer and talks to X from your own IP.](assets/how-it-works.png)
 
 Your coding agent calls the CLI. The CLI reads and writes local SQLite data and calls X directly. Cookies use the OS keychain when available, with an owner-only file fallback.
 
 ## Before you use it
 
-X allows automated DMs only to people who sent you a DM first ([X developer guidelines](https://docs.x.com/developer-guidelines)). Reachloop follows that rule in code. It refuses to DM anyone who has not written to the sending account, and that check runs before every send.
+The [X developer guidelines](https://docs.x.com/developer-guidelines) restrict automated DMs to people who sent you a DM first. Reachloop enables outbound DMs by default; that product setting is not permission from X to send automated cold DMs. Recipient privacy settings and X permissions still apply, and X may restrict or suspend accounts for automation. Use an account you can afford to lose while you try Reachloop, and keep volumes low.
 
-X can still suspend accounts it sees as automated. Use an account you can afford to lose while you try Reachloop, and keep volumes low.
+You can turn on reply-only mode per account to restrict sends to people who have already written to that same account. Incoming message requests count.
 
 ## Install
 
@@ -77,8 +75,14 @@ reachloop lead list --tag founders
 reachloop inbox sync
 reachloop inbox list --unread
 reachloop inbox show @jane
-reachloop inbox reply @jane --text "Thanks for writing! ..." --yes
+reachloop inbox send @jane --text "Hi Jane, ..." --yes
+reachloop inbox reply @jane --text "Thanks for writing! ..." --yes  # alias for send
+reachloop limits show @myaccount
+reachloop limits set @myaccount --reply-only on
+reachloop limits set @myaccount --dm 75
 ```
+
+`inbox send` can start a conversation with any handle; saving a lead first is optional. `inbox reply` remains a backward-compatible alias and uses the same account settings. Both require `--yes` to confirm a real send. Add `--account @myaccount` to select the sender. `--dry-run` previews without sending or consuming quota and does not require `--yes`; account/session, cap and optional reply-only checks still apply. For example: `reachloop inbox send @jane --text "Hi Jane, ..." --dry-run`.
 
 Every command accepts `--json` and returns `{"ok": true, "data": ...}` or `{"ok": false, "error": {...}}` with a stable exit code. The full command list and exit codes are in [skills/reachloop/reference/commands.md](skills/reachloop/reference/commands.md).
 
@@ -96,9 +100,10 @@ reachloop lead list --limit 20 --json
 
 ## Limits
 
-- Reply-only. A person must have sent a DM to that account first. A message request counts.
-- Each account sends at most 50 DMs a day by default. `reachloop limits set @account --dm N` changes it, up to 200. Nothing raises that maximum.
-- The same reply to the same person on the same day goes out once, even if the command runs twice.
+- Reply-only is optional and off by default for existing and new accounts. `reachloop limits set @account --reply-only on` requires a prior inbound DM to that same account; message requests count. Use `--reply-only off` to disable it.
+- Each account sends at most 50 DMs a day by default. `reachloop limits set @account --dm N` explicitly changes that account’s cap from 0 to 250. No setting exceeds the hard maximum of 250, and saved caps are never automatically raised.
+- `reachloop limits show @account` shows the account’s cap, today’s usage, `replyOnly` and `hardMax: 250`. You can combine `--dm N` and `--reply-only on|off` in one `limits set` command.
+- Every send checks confirmation, account/session state and the daily cap. Paused accounts cannot send. The same text to the same person on the same day goes out once, even if the command runs twice.
 - Reachloop warns when you add a fourth account, because every account on one computer shares one IP address.
 
 ## Where your data lives
