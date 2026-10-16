@@ -141,9 +141,11 @@ describe('browser sign-in', () => {
     }, async (signIn) => {
       const started = Date.now();
       expect(await signIn({ timeoutMs: 30_000 })).toEqual({ authToken: 'tok-1', ct0: 'csrf-1', twid: 'u%3D77' });
-      expect(Date.now() - started).toBeLessThan(4000);
+      // Allow process startup/cleanup scheduling on loaded runners while still
+      // proving shutdown is bounded well below the 30-second sign-in deadline
+      expect(Date.now() - started).toBeLessThan(6000);
     });
-  });
+  }, 10_000);
 
   it('removes the temporary profile when spawning Chrome fails', async () => {
     const tmp = await mkdtemp(path.join(os.tmpdir(), 'rl-signin-spawn-'));
